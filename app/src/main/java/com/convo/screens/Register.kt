@@ -1,19 +1,46 @@
 package com.convo.screens
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
@@ -25,16 +52,76 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.convo.R
 import com.convo.network.ApiClient
 import com.convo.network.models.RegisterRequest
-import com.convo.ui.theme.*
+import com.convo.ui.components.ExitConfirmationDialog
+import com.convo.ui.components.OtpVerificationDialog
+import com.convo.ui.theme.AccentError
+import com.convo.ui.theme.AccentPrimary
+import com.convo.ui.theme.BgPrimary
+import com.convo.ui.theme.BgSecondary
+import com.convo.ui.theme.BorderColor
+import com.convo.ui.theme.ConvoTheme
+import com.convo.ui.theme.TextMuted
+import com.convo.ui.theme.TextPrimary
+import com.convo.ui.theme.TextSecondary
+import com.convo.utils.OtpReceiver
 import com.convo.utils.ValidationUtils
 import com.google.gson.Gson
 import kotlinx.coroutines.launch
 
 class Register : BaseActivity() {
+
+    private var otpReceiver: OtpReceiver? = null
+    private var onOtpReceivedCallback: ((String) -> Unit)? = null
+
+    private val smsPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.entries.all { it.value }
+        if (allGranted) {
+            registerOtpReceiver()
+        }
+    }
+
+    private fun checkAndRequestSmsPermission() {
+        val permissions = arrayOf(
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.READ_SMS
+        )
+        val allGranted = permissions.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
+        if (allGranted) {
+            registerOtpReceiver()
+        } else {
+            smsPermissionLauncher.launch(permissions)
+        }
+    }
+
+    private fun registerOtpReceiver() {
+        if (otpReceiver == null) {
+            otpReceiver = OtpReceiver.register(this) { otp ->
+                onOtpReceivedCallback?.invoke(otp)
+            }
+        }
+    }
+
+    private fun unregisterOtpReceiver() {
+        otpReceiver?.let {
+            OtpReceiver.unregister(this, it)
+            otpReceiver = null
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterOtpReceiver()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -44,17 +131,223 @@ class Register : BaseActivity() {
                 var isLoading by remember { mutableStateOf(false) }
                 var errorMessage by remember { mutableStateOf<String?>(null) }
 
+                // OTP Dialog state
+                var showOtpDialog by remember { mutableStateOf(false) }
+                var otp by remember { mutableStateOf("") }
+                var otpErrorMessage by remember { mutableStateOf<String?>(null) }
+                var isVerifyingOtp by remember { mutableStateOf(false) }
+                var isSendingOtp by remember { mutableStateOf(false) }
+                var resendTimerKey by remember { mutableStateOf(0L) }
+
+                // Store form data for registration after OTP verification
+                var pendingEmail by remember { mutableStateOf("") }
+                var pendingUsername by remember { mutableStateOf("") }
+                var pendingPhone by remember { mutableStateOf("") }
+                var pendingPassword by remember { mutableStateOf("") }
+                var pendingFirstName by remember { mutableStateOf("") }
+                var pendingLastName by remember { mutableStateOf("") }
+
+                // Set up OTP received callback
+                LaunchedEffect(showOtpDialog) {
+                    if (showOtpDialog) {
+                        onOtpReceivedCallback = { receivedOtp ->
+                            otp = receivedOtp
+                        }
+                    } else {
+                        onOtpReceivedCallback = null
+                    }
+                }
+
                 // Handle back press
                 DisposableEffect(Unit) {
                     val callback = object : OnBackPressedCallback(true) {
                         override fun handleOnBackPressed() {
-                            if (!isLoading) {
+                            if (!isLoading && !showOtpDialog) {
                                 showExitDialog = true
                             }
                         }
                     }
                     onBackPressedDispatcher.addCallback(callback)
                     onDispose { callback.remove() }
+                }
+
+                // Send OTP function
+                fun sendOtp(phoneNumber: String, onSuccess: () -> Unit = {}) {
+                    isSendingOtp = true
+                    otpErrorMessage = null
+
+                    lifecycleScope.launch {
+                        try {
+                            android.util.Log.d("Register", "Sending OTP to: $phoneNumber")
+                            val response = ApiClient.apiService.sendOtp(phoneNumber)
+                            android.util.Log.d("Register", "Send OTP response: ${response.code()}")
+
+                            if (response.isSuccessful && response.body()?.success == true) {
+                                resendTimerKey = System.currentTimeMillis()
+                                onSuccess()
+                            } else {
+                                val errorBody = response.errorBody()?.string()
+                                val apiError = try {
+                                    Gson().fromJson(
+                                        errorBody,
+                                        com.convo.network.models.ApiErrorResponse::class.java
+                                    )
+                                } catch (e: Exception) {
+                                    null
+                                }
+                                otpErrorMessage =
+                                    apiError?.message ?: "Failed to send OTP. Please try again."
+                                isLoading = false
+                            }
+                        } catch (e: Exception) {
+                            android.util.Log.e("Register", "Send OTP exception: ${e.message}", e)
+                            otpErrorMessage = "Network error: ${e.message}"
+                            isLoading = false
+                        } finally {
+                            isSendingOtp = false
+                        }
+                    }
+                }
+
+                // Register function (called after OTP verification)
+                fun performRegistration() {
+                    isVerifyingOtp = true
+
+                    lifecycleScope.launch {
+                        try {
+                            val request = RegisterRequest(
+                                username = pendingUsername,
+                                email = pendingEmail,
+                                phoneNumber = pendingPhone,
+                                password = pendingPassword,
+                                firstname = pendingFirstName.ifBlank { null },
+                                lastname = pendingLastName.ifBlank { null }
+                            )
+
+                            android.util.Log.d("Register", "Sending registration request: $request")
+                            val response = ApiClient.apiService.register(request)
+                            android.util.Log.d("Register", "Response code: ${response.code()}")
+
+                            if (response.isSuccessful && response.body()?.success == true) {
+                                Toast.makeText(
+                                    this@Register,
+                                    response.body()?.message ?: "Registration successful!",
+                                    Toast.LENGTH_LONG
+                                ).show()
+
+                                showOtpDialog = false
+                                unregisterOtpReceiver()
+
+                                // Navigate to Login
+                                startActivity(Intent(this@Register, Login::class.java))
+                                finish()
+                            } else {
+                                val errorBody = response.errorBody()?.string()
+                                android.util.Log.e("Register", "Error response: $errorBody")
+
+                                val apiError = try {
+                                    Gson().fromJson(
+                                        errorBody,
+                                        com.convo.network.models.ApiErrorResponse::class.java
+                                    )
+                                } catch (e: Exception) {
+                                    null
+                                }
+
+                                otpErrorMessage = when (response.code()) {
+                                    404 -> "Server endpoint not found. Please contact support."
+                                    500 -> "Server error. Please try again later."
+                                    400 -> apiError?.message
+                                        ?: "Invalid request. Please check your input."
+
+                                    409 -> apiError?.message ?: "User already exists."
+                                    else -> apiError?.message
+                                        ?: "Registration failed (${response.code()}). Please try again."
+                                }
+                            }
+                        } catch (e: Exception) {
+                            android.util.Log.e("Register", "Network exception: ${e.message}", e)
+                            otpErrorMessage = "Network error: ${e.message}"
+                        } finally {
+                            isVerifyingOtp = false
+                        }
+                    }
+                }
+
+                // Verify OTP function
+                fun verifyOtp(phoneNumber: String, otpCode: String) {
+                    // Validate OTP
+                    if (otpCode.length != 6) {
+                        otpErrorMessage = "Please enter a valid 6-digit OTP"
+                        return
+                    }
+                    if (!otpCode.all { it.isDigit() }) {
+                        otpErrorMessage = "OTP must contain only digits"
+                        return
+                    }
+
+                    isVerifyingOtp = true
+                    otpErrorMessage = null
+
+                    lifecycleScope.launch {
+                        try {
+                            android.util.Log.d("Register", "Verifying OTP: $otpCode for $phoneNumber")
+                            val response = ApiClient.apiService.verifyOtp(phoneNumber, otpCode)
+                            android.util.Log.d(
+                                "Register",
+                                "Verify OTP response: ${response.code()}"
+                            )
+
+                            if (response.isSuccessful && response.body()?.success == true) {
+                                // OTP verified - now perform registration
+                                performRegistration()
+                            } else {
+                                val errorBody = response.errorBody()?.string()
+                                val apiError = try {
+                                    Gson().fromJson(
+                                        errorBody,
+                                        com.convo.network.models.ApiErrorResponse::class.java
+                                    )
+                                } catch (e: Exception) {
+                                    null
+                                }
+                                otpErrorMessage = when (response.code()) {
+                                    400 -> apiError?.message ?: "Invalid OTP. Please try again."
+                                    410 -> "OTP has expired. Please request a new one."
+                                    else -> apiError?.message
+                                        ?: "Verification failed. Please try again."
+                                }
+                                isVerifyingOtp = false
+                            }
+                        } catch (e: Exception) {
+                            android.util.Log.e("Register", "Verify OTP exception: ${e.message}", e)
+                            otpErrorMessage = "Network error: ${e.message}"
+                            isVerifyingOtp = false
+                        }
+                    }
+                }
+
+                // OTP Verification Dialog
+                if (showOtpDialog) {
+                    OtpVerificationDialog(
+                        phoneNumber = pendingPhone,
+                        otp = otp,
+                        onOtpChange = { newOtp ->
+                            otp = newOtp
+                            otpErrorMessage = null
+                        },
+                        isLoading = isVerifyingOtp,
+                        isSendingOtp = isSendingOtp,
+                        errorMessage = otpErrorMessage,
+                        resendTimerKey = resendTimerKey,
+                        onVerify = {
+                            verifyOtp(pendingPhone, otp)
+                        },
+                        onResendOtp = {
+                            otp = ""
+                            sendOtp(pendingPhone)
+                        }
+                    )
                 }
 
                 RegisterScreen(
@@ -70,7 +363,8 @@ class Register : BaseActivity() {
                         val emailValidation = ValidationUtils.validateEmail(email)
                         val phoneValidation = ValidationUtils.validatePhoneNumber(phone)
                         val passwordValidation = ValidationUtils.validatePassword(password)
-                        val firstNameValidation = ValidationUtils.validateName(firstName, "First name")
+                        val firstNameValidation =
+                            ValidationUtils.validateName(firstName, "First name")
                         val lastNameValidation = ValidationUtils.validateName(lastName, "Last name")
 
                         // Check for validation errors
@@ -88,64 +382,25 @@ class Register : BaseActivity() {
                             return@RegisterScreen
                         }
 
-                        // Make API call
+                        // Store form data for later registration
+                        pendingUsername = username
+                        pendingEmail = email
+                        pendingPhone = phone
+                        pendingPassword = password
+                        pendingFirstName = firstName
+                        pendingLastName = lastName
+
+                        // Request SMS permission and register receiver
+                        checkAndRequestSmsPermission()
+
+                        // Start loading and send OTP first (before registration)
                         isLoading = true
                         errorMessage = null
 
-                        lifecycleScope.launch {
-                            try {
-                                val request = RegisterRequest(
-                                    username = username,
-                                    email = email,
-                                    phoneNumber = phone,
-                                    password = password,
-                                    firstname = firstName.ifBlank { null },
-                                    lastname = lastName.ifBlank { null }
-                                )
-
-
-                                android.util.Log.d("Register", "Sending registration request: $request")
-
-                                val response = ApiClient.apiService.register(request)
-
-                                android.util.Log.d("Register", "Response code: ${response.code()}")
-
-                                if (response.isSuccessful && response.body()?.success == true) {
-                                    Toast.makeText(
-                                        this@Register,
-                                        response.body()?.message ?: "Registration successful!",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-
-                                    // Navigate to Login
-                                    startActivity(Intent(this@Register, Login::class.java))
-                                    finish()
-                                } else {
-                                    // Parse error response
-                                    val errorBody = response.errorBody()?.string()
-                                    android.util.Log.e("Register", "Error response: $errorBody")
-
-                                    val apiError = try {
-                                        Gson().fromJson(errorBody, com.convo.network.models.ApiErrorResponse::class.java)
-                                    } catch (e: Exception) {
-                                        android.util.Log.e("Register", "Failed to parse error: ${e.message}")
-                                        null
-                                    }
-
-                                    errorMessage = when (response.code()) {
-                                        404 -> "Server endpoint not found. Please contact support."
-                                        500 -> "Server error. Please try again later."
-                                        400 -> apiError?.message ?: "Invalid request. Please check your input."
-                                        409 -> apiError?.message ?: "User already exists."
-                                        else -> apiError?.message ?: "Registration failed (${response.code()}). Please try again."
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                android.util.Log.e("Register", "Network exception: ${e.message}", e)
-                                errorMessage = "Network error: ${e.message}"
-                            } finally {
-                                isLoading = false
-                            }
+                        sendOtp(phone) {
+                            // Show OTP dialog after OTP is sent
+                            showOtpDialog = true
+                            isLoading = false
                         }
                     },
                     onLoginClick = {
@@ -331,7 +586,9 @@ fun RegisterScreen(
             // Phone Number Field
             OutlinedTextField(
                 value = phoneNumber,
-                onValueChange = { if (it.length <= 10 && it.all { c -> c.isDigit() }) phoneNumber = it },
+                onValueChange = {
+                    if (it.length <= 10 && it.all { c -> c.isDigit() }) phoneNumber = it
+                },
                 label = { Text("Phone Number", color = TextMuted) },
                 placeholder = { Text("Enter your phone number", color = TextMuted) },
                 singleLine = true,
@@ -391,7 +648,16 @@ fun RegisterScreen(
 
             // Register Button
             Button(
-                onClick = { onRegisterClick(username, email, phoneNumber, password, firstName, lastName) },
+                onClick = {
+                    onRegisterClick(
+                        username,
+                        email,
+                        phoneNumber,
+                        password,
+                        firstName,
+                        lastName
+                    )
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),

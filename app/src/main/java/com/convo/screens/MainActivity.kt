@@ -14,18 +14,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.sp
-import com.convo.network.SessionManager
+import androidx.lifecycle.lifecycleScope
+import com.convo.network.ApiClient
 import com.convo.ui.theme.AccentPrimary
 import com.convo.ui.theme.BgPrimary
 import com.convo.ui.theme.ConvoTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : BaseActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Initialize SessionManager
-        SessionManager.init(this)
+        // Initialize ApiClient with context (required for CookieJar)
+        ApiClient.init(this)
 
         setContent {
             ConvoTheme(dynamicColor = false) {
@@ -43,13 +45,56 @@ class MainActivity : BaseActivity() {
     }
 
     private fun checkSessionAndNavigate() {
-        if (SessionManager.hasSession()) {
-            // Session exists - go to Dashboard
-            startActivity(Intent(this, Dashboard::class.java))
-        } else {
-            // No session - go to Login
-            startActivity(Intent(this, Login::class.java))
+        // First check if session cookie exists locally
+        if (!ApiClient.hasValidSession()) {
+            // No session cookie - go directly to Login
+            android.util.Log.d("MainActivity", "No session cookie found, navigating to Login")
+            navigateToLogin()
+            return
         }
+
+        // Session cookie exists - verify with server
+        android.util.Log.d("MainActivity", "Session cookie found, checking with server...")
+        lifecycleScope.launch {
+            try {
+                val response = ApiClient.apiService.checkSessionExpire()
+                val responseBody = response.body() ?: ""
+                android.util.Log.d("MainActivity", "Session check response: ${response.code()} - $responseBody")
+
+                when {
+                    response.code() == 200 -> {
+                        // Session valid - go to Dashboard
+                        android.util.Log.d("MainActivity", "Session valid, navigating to Dashboard")
+                        navigateToDashboard()
+                    }
+                    response.code() == 503 -> {
+                        // Session expired - clear cookies and go to Login
+                        android.util.Log.d("MainActivity", "Session expired, clearing and navigating to Login")
+                        ApiClient.clearSession()
+                        navigateToLogin()
+                    }
+                    else -> {
+                        // Other error - treat as expired for safety
+                        android.util.Log.w("MainActivity", "Unexpected response: ${response.code()}, treating as expired")
+                        ApiClient.clearSession()
+                        navigateToLogin()
+                    }
+                }
+            } catch (e: Exception) {
+                // Network error - go to login for safety
+                android.util.Log.e("MainActivity", "Session check failed: ${e.message}", e)
+                navigateToLogin()
+            }
+        }
+    }
+
+    private fun navigateToLogin() {
+        startActivity(Intent(this, Login::class.java))
+        finish()
+    }
+
+    private fun navigateToDashboard() {
+        startActivity(Intent(this, Dashboard::class.java))
         finish()
     }
 }

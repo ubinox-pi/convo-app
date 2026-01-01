@@ -1,16 +1,43 @@
 package com.convo.screens
 
+import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
@@ -22,22 +49,57 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
 import com.convo.R
-import com.convo.ui.theme.*
+import com.convo.network.ApiClient
+import com.convo.network.models.ApiErrorResponse
+import com.convo.ui.components.ExitConfirmationDialog
+import com.convo.ui.theme.AccentError
+import com.convo.ui.theme.AccentPrimary
+import com.convo.ui.theme.BgPrimary
+import com.convo.ui.theme.BgSecondary
+import com.convo.ui.theme.BorderColor
+import com.convo.ui.theme.ConvoTheme
+import com.convo.ui.theme.TextMuted
+import com.convo.ui.theme.TextPrimary
+import com.convo.ui.theme.TextSecondary
+import com.google.gson.Gson
+import kotlinx.coroutines.launch
 
 class Login : BaseActivity() {
+
+    private fun getDeviceModel(): String {
+        return "${Build.MANUFACTURER} ${Build.MODEL}"
+    }
+
+    private fun getDeviceOs(): String {
+        return "Android ${Build.VERSION.RELEASE}"
+    }
+
+    private fun getDeviceId(context: Context): String {
+        return Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+    }
+
+    private fun getDeviceToken(): String {
+        // TODO: Replace with actual FCM token when Firebase is integrated
+        return "placeholder_token"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         setContent {
             ConvoTheme(dynamicColor = false) {
                 var showExitDialog by remember { mutableStateOf(false) }
+                var isLoading by remember { mutableStateOf(false) }
+                var errorMessage by remember { mutableStateOf<String?>(null) }
 
-                // Handle back press
                 DisposableEffect(Unit) {
                     val callback = object : OnBackPressedCallback(true) {
                         override fun handleOnBackPressed() {
-                            showExitDialog = true
+                            if (!isLoading) {
+                                showExitDialog = true
+                            }
                         }
                     }
                     onBackPressedDispatcher.addCallback(callback)
@@ -48,8 +110,78 @@ class Login : BaseActivity() {
                     showExitDialog = showExitDialog,
                     onDismissExitDialog = { showExitDialog = false },
                     onConfirmExit = { finishAffinity() },
-                    onLoginClick = { email, password ->
-                        // Handle login API call
+                    isLoading = isLoading,
+                    errorMessage = errorMessage,
+                    onErrorDismiss = { errorMessage = null },
+                    onLoginClick = { username, password ->
+                        if (username.isBlank()) {
+                            errorMessage = "Please enter your username"
+                            return@LoginScreen
+                        }
+                        if (password.isBlank()) {
+                            errorMessage = "Please enter your password"
+                            return@LoginScreen
+                        }
+
+                        isLoading = true
+                        errorMessage = null
+
+                        lifecycleScope.launch {
+                            try {
+                                val deviceModel = getDeviceModel()
+                                val deviceOs = getDeviceOs()
+                                val deviceId = getDeviceId(this@Login)
+                                val deviceToken = getDeviceToken()
+
+                                android.util.Log.d("Login", "Logging in user: $username")
+                                android.util.Log.d("Login", "Device: $deviceModel, OS: $deviceOs, ID: $deviceId")
+
+                                val response = ApiClient.apiService.login(
+                                    username = username,
+                                    password = password,
+                                    deviceModel = deviceModel,
+                                    deviceOs = deviceOs,
+                                    deviceId = deviceId,
+                                    deviceToken = deviceToken
+                                )
+
+                                android.util.Log.d("Login", "Response code: ${response.code()}")
+
+                                if (response.isSuccessful && response.body()?.success == true) {
+                                    // Session cookie is automatically handled by CookieJar
+                                    Toast.makeText(
+                                        this@Login,
+                                        response.body()?.message ?: "Login successful!",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+
+                                    // Navigate to Dashboard
+                                    startActivity(Intent(this@Login, Dashboard::class.java))
+                                    finish()
+                                } else {
+                                    val errorBody = response.errorBody()?.string()
+                                    android.util.Log.e("Login", "Error response: $errorBody")
+
+                                    val apiError = try {
+                                        Gson().fromJson(errorBody, ApiErrorResponse::class.java)
+                                    } catch (e: Exception) {
+                                        null
+                                    }
+
+                                    errorMessage = apiError?.message ?: when (response.code()) {
+                                        401 -> "Invalid username or password"
+                                        403 -> "Account is locked or disabled"
+                                        404 -> "User not found"
+                                        else -> "Login failed (${response.code()}). Please try again."
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.e("Login", "Network exception: ${e.message}", e)
+                                errorMessage = "Network error: ${e.message}"
+                            } finally {
+                                isLoading = false
+                            }
+                        }
                     },
                     onRegisterClick = {
                         startActivity(Intent(this, Register::class.java))
@@ -69,11 +201,14 @@ fun LoginScreen(
     showExitDialog: Boolean = false,
     onDismissExitDialog: () -> Unit = {},
     onConfirmExit: () -> Unit = {},
-    onLoginClick: (email: String, password: String) -> Unit = { _, _ -> },
+    isLoading: Boolean = false,
+    errorMessage: String? = null,
+    onErrorDismiss: () -> Unit = {},
+    onLoginClick: (username: String, password: String) -> Unit = { _, _ -> },
     onRegisterClick: () -> Unit = {},
     onForgotPasswordClick: () -> Unit = {}
 ) {
-    var email by remember { mutableStateOf("") }
+    var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
 
@@ -115,15 +250,48 @@ fun LoginScreen(
 
             Spacer(modifier = Modifier.height(60.dp))
 
-            // Email Field
+            // Error message
+            if (errorMessage != null) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 16.dp),
+                    colors = CardDefaults.cardColors(containerColor = AccentError.copy(alpha = 0.1f)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = errorMessage,
+                            color = AccentError,
+                            fontSize = 14.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = "✕",
+                            color = AccentError,
+                            fontSize = 16.sp,
+                            modifier = Modifier.clickable { onErrorDismiss() }
+                        )
+                    }
+                }
+            }
+
+            // Username Field
             OutlinedTextField(
-                value = email,
-                onValueChange = { email = it },
-                label = { Text("Email", color = TextMuted) },
-                placeholder = { Text("Enter your email", color = TextMuted) },
+                value = username,
+                onValueChange = { username = it },
+                label = { Text("Username", color = TextMuted) },
+                placeholder = { Text("Enter your username", color = TextMuted) },
                 singleLine = true,
+                enabled = !isLoading,
                 keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Email,
+                    keyboardType = KeyboardType.Text,
                     imeAction = ImeAction.Next
                 ),
                 colors = OutlinedTextFieldDefaults.colors(
@@ -135,7 +303,10 @@ fun LoginScreen(
                     unfocusedLabelColor = TextMuted,
                     cursorColor = AccentPrimary,
                     focusedContainerColor = BgSecondary,
-                    unfocusedContainerColor = BgSecondary
+                    unfocusedContainerColor = BgSecondary,
+                    disabledTextColor = TextMuted,
+                    disabledBorderColor = BorderColor.copy(alpha = 0.5f),
+                    disabledContainerColor = BgSecondary.copy(alpha = 0.5f)
                 ),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
@@ -150,6 +321,7 @@ fun LoginScreen(
                 label = { Text("Password", color = TextMuted) },
                 placeholder = { Text("Enter your password", color = TextMuted) },
                 singleLine = true,
+                enabled = !isLoading,
                 visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Password,
@@ -160,7 +332,7 @@ fun LoginScreen(
                         Icon(
                             painter = painterResource(
                                 id = if (passwordVisible) R.drawable.ic_visibility_off
-                                     else R.drawable.ic_visibility
+                                else R.drawable.ic_visibility
                             ),
                             contentDescription = if (passwordVisible) "Hide password" else "Show password",
                             tint = TextMuted
@@ -176,7 +348,10 @@ fun LoginScreen(
                     unfocusedLabelColor = TextMuted,
                     cursorColor = AccentPrimary,
                     focusedContainerColor = BgSecondary,
-                    unfocusedContainerColor = BgSecondary
+                    unfocusedContainerColor = BgSecondary,
+                    disabledTextColor = TextMuted,
+                    disabledBorderColor = BorderColor.copy(alpha = 0.5f),
+                    disabledContainerColor = BgSecondary.copy(alpha = 0.5f)
                 ),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
@@ -193,7 +368,7 @@ fun LoginScreen(
                     text = "Forgot Password?",
                     color = AccentPrimary,
                     fontSize = 14.sp,
-                    modifier = Modifier.clickable { onForgotPasswordClick() }
+                    modifier = Modifier.clickable(enabled = !isLoading) { onForgotPasswordClick() }
                 )
             }
 
@@ -201,21 +376,32 @@ fun LoginScreen(
 
             // Login Button
             Button(
-                onClick = { onLoginClick(email, password) },
+                onClick = { onLoginClick(username, password) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
+                enabled = !isLoading,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = AccentPrimary,
-                    contentColor = TextPrimary
+                    contentColor = TextPrimary,
+                    disabledContainerColor = AccentPrimary.copy(alpha = 0.5f),
+                    disabledContentColor = TextPrimary.copy(alpha = 0.5f)
                 ),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Text(
-                    text = "Login",
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
+                if (isLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        color = TextPrimary,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Text(
+                        text = "Login",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.weight(1f))
@@ -235,65 +421,13 @@ fun LoginScreen(
                     color = AccentPrimary,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.clickable { onRegisterClick() }
+                    modifier = Modifier.clickable(enabled = !isLoading) { onRegisterClick() }
                 )
             }
         }
     }
 }
 
-@Composable
-fun ExitConfirmationDialog(
-    onDismiss: () -> Unit,
-    onConfirm: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = BgSecondary,
-        shape = RoundedCornerShape(16.dp),
-        title = {
-            Text(
-                text = "Exit App",
-                color = TextPrimary,
-                fontWeight = FontWeight.Bold,
-                fontSize = 20.sp
-            )
-        },
-        text = {
-            Text(
-                text = "Are you sure you want to exit the app?",
-                color = TextSecondary,
-                fontSize = 16.sp
-            )
-        },
-        confirmButton = {
-            Button(
-                onClick = onConfirm,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = AccentError,
-                    contentColor = TextPrimary
-                ),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Text("OK", fontWeight = FontWeight.SemiBold)
-            }
-        },
-        dismissButton = {
-            OutlinedButton(
-                onClick = onDismiss,
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = TextPrimary
-                ),
-                border = ButtonDefaults.outlinedButtonBorder.copy(
-                    brush = androidx.compose.ui.graphics.SolidColor(BorderColor)
-                ),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Text("Cancel", fontWeight = FontWeight.SemiBold)
-            }
-        }
-    )
-}
 
 @Preview(showBackground = true, showSystemUi = true)
 @Composable
